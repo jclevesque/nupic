@@ -223,7 +223,6 @@ class HTMPredictionModel(Model):
     self._hasTP = tmEnable
     self._hasCL = clEnable
 
-    self._classifierInputEncoder = None
     self._predictedFieldIdx = None
     self._predictedFieldName = None
     self._numFields = None
@@ -323,8 +322,9 @@ class HTMPredictionModel(Model):
   def enableInference(self, inferenceArgs=None):
     super(HTMPredictionModel, self).enableInference(inferenceArgs)
     if inferenceArgs is not None and "predictedField" in inferenceArgs:
-      self._getSensorRegion().setParameter("predictedField",
-                                           str(inferenceArgs["predictedField"]))
+      pass
+      # self._getSensorRegion().setParameter("predictedField",
+      #                                     str(inferenceArgs["predictedField"]))
 
 
   def enableLearning(self):
@@ -464,7 +464,6 @@ class HTMPredictionModel(Model):
     if self.__logger.isEnabledFor(logging.DEBUG):
       self.__logger.debug("inputRecord: %r, results: %r" % (inputRecord,
                                                             results))
-
     return results
 
 
@@ -591,13 +590,36 @@ class HTMPredictionModel(Model):
                          "TM, SP, or Sensor regions")
 
     inputTSRecordIdx = rawInput.get('_timestampRecordIdx')
-    return self._handleSDRClassifierMultiStep(
-        patternNZ=patternNZ,
-        inputTSRecordIdx=inputTSRecordIdx,
-        rawInput=rawInput)
+
+    inferenceArgs = self.getInferenceArgs()
+    predictedField = inferenceArgs.get('predictedField', None)
+    if predictedField is None:
+      raise ValueError(
+        "No predicted field was enabled! Did you call enableInference()?"
+      )
+
+    if isinstance(predictedField, str):
+      return self._handleSDRClassifierMultiStep(classifier=self._getClassifierRegion(),
+                                                predictedFieldName=predictedField,
+                                                patternNZ=patternNZ,
+                                                inputTSRecordIdx=inputTSRecordIdx,
+                                                rawInput=rawInput)
+    elif isinstance(predictedField, list):
+      # Now returns a nested structure, with one inference per predictedField
+      inferences = {}
+      # Multiple output prediction
+      for i, pf in enumerate(predictedField):
+        inf = self._handleSDRClassifierMultiStep(classifier=self._getClassifierRegion(i=i),
+                                                 predictedFieldName=pf,
+                                                 patternNZ=patternNZ,
+                                                 inputTSRecordIdx=inputTSRecordIdx,
+                                                 rawInput=rawInput)
+        inferences[pf] = inf
+      return inferences
 
 
   def _classificationCompute(self):
+    # This is called by the deprecated classification mode
     inference = {}
     classifier = self._getClassifierRegion()
     classifier.setParameter('inferenceMode', True)
@@ -702,7 +724,10 @@ class HTMPredictionModel(Model):
     return inferences
 
 
-  def _handleSDRClassifierMultiStep(self, patternNZ,
+  def _handleSDRClassifierMultiStep(self,
+                                    classifier,
+                                    predictedFieldName,
+                                    patternNZ,
                                     inputTSRecordIdx,
                                     rawInput):
     """ Handle the CLA Classifier compute logic when implementing multi-step
@@ -714,6 +739,9 @@ class HTMPredictionModel(Model):
 
     Parameters:
     -------------------------------------------------------------------
+    classifier: Classifier with which to compute predictions, there is one
+              classifier per predictedField.
+    predictedFieldName: Corresponding predictedField name for given classifier.
     patternNZ: The input to the CLA Classifier as a list of active input indices
     inputTSRecordIdx: The index of the record as computed from the timestamp
                   and aggregation interval. This normally increments by 1
@@ -722,19 +750,12 @@ class HTMPredictionModel(Model):
                   None.
     rawInput:   The raw input to the sensor, as a dict.
     """
-    inferenceArgs = self.getInferenceArgs()
-    predictedFieldName = inferenceArgs.get('predictedField', None)
-    if predictedFieldName is None:
-      raise ValueError(
-        "No predicted field was enabled! Did you call enableInference()?"
-      )
-    self._predictedFieldName = predictedFieldName
 
-    classifier = self._getClassifierRegion()
+    classifier._predictedFieldName = predictedFieldName
     if not self._hasCL or classifier is None:
       # No classifier so return an empty dict for inferences.
       return {}
-
+    
     sensor = self._getSensorRegion()
     minLikelihoodThreshold = self._minLikelihoodThreshold
     maxPredictionsPerStep = self._maxPredictionsPerStep
@@ -742,12 +763,7 @@ class HTMPredictionModel(Model):
     inferences = {}
 
     # Get the classifier input encoder, if we don't have it already
-    if self._classifierInputEncoder is None:
-      if predictedFieldName is None:
-        raise RuntimeError("This experiment description is missing "
-              "the 'predictedField' in its config, which is required "
-              "for multi-step prediction inference.")
-
+    if getattr(classifier, "_inputEncoder", None) is None:
       encoderList = sensor.getSelf().encoder.getEncoderList()
       self._numFields = len(encoderList)
 
@@ -768,15 +784,14 @@ class HTMPredictionModel(Model):
         encoderList = []
       if len(encoderList) >= 1:
         fieldNames = sensor.getSelf().disabledEncoder.getScalarNames()
-        self._classifierInputEncoder = encoderList[fieldNames.index(
+        classifier._inputEncoder = encoderList[fieldNames.index(
                                                         predictedFieldName)]
       else:
         # Legacy multi-step networks don't have a separate encoder for the
         #  classifier, so use the one that goes into the bottom of the network
         encoderList = sensor.getSelf().encoder.getEncoderList()
-        self._classifierInputEncoder = encoderList[self._predictedFieldIdx]
-
-
+        classifier._inputEncoder = encoderList[self._predictedFieldIdx]
+        
 
     # Get the actual value and the bucket index for this sample. The
     # predicted field may not be enabled for input to the network, so we
@@ -787,11 +802,11 @@ class HTMPredictionModel(Model):
                        "field configured for this model. Missing value for '%s'"
                        % predictedFieldName)
     absoluteValue = rawInput[predictedFieldName]
-    bucketIdx = self._classifierInputEncoder.getBucketIndices(absoluteValue)[0]
+    bucketIdx = classifier._inputEncoder.getBucketIndices(absoluteValue)[0]
 
     # Convert the absolute values to deltas if necessary
     # The bucket index should be handled correctly by the underlying delta encoder
-    if isinstance(self._classifierInputEncoder, DeltaEncoder):
+    if isinstance(classifier._inputEncoder, DeltaEncoder):
       # Make the delta before any values have been seen 0 so that we do not mess up the
       # range for the adaptive scalar encoder.
       if not hasattr(self,"_ms_prevVal"):
@@ -876,13 +891,13 @@ class HTMPredictionModel(Model):
       # calculate likelihood for each bucket
       bucketLikelihood = {}
       for k in likelihoodsDict.keys():
-        bucketLikelihood[self._classifierInputEncoder.getBucketIndices(k)[0]] = (
+        bucketLikelihood[classifier._inputEncoder.getBucketIndices(k)[0]] = (
                                                                 likelihoodsDict[k])
 
       # ---------------------------------------------------------------------
       # If we have a delta encoder, we have to shift our predicted output value
       #  by the sum of the deltas
-      if isinstance(self._classifierInputEncoder, DeltaEncoder):
+      if isinstance(classifier._inputEncoder, DeltaEncoder):
         # Get the prediction history for this number of timesteps.
         # The prediction history is a store of the previous best predicted values.
         # This is used to get the final shift from the current absolute value.
@@ -907,7 +922,7 @@ class HTMPredictionModel(Model):
         # calculate likelihood for each bucket
         bucketLikelihoodOffset = {}
         for k in offsetDict.keys():
-          bucketLikelihoodOffset[self._classifierInputEncoder.getBucketIndices(k)[0]] = (
+          bucketLikelihoodOffset[classifier._inputEncoder.getBucketIndices(k)[0]] = (
                                                                             offsetDict[k])
 
 
@@ -945,7 +960,6 @@ class HTMPredictionModel(Model):
                                                       bestActValue)
         inferences[InferenceElement.multiStepBucketLikelihoods][steps] = (
                                                       bucketLikelihood)
-
 
     return inferences
 
@@ -1049,13 +1063,14 @@ class HTMPredictionModel(Model):
     return self._netInfo.net.regions['sensor']
 
 
-  def _getClassifierRegion(self):
+  def _getClassifierRegion(self, i=None):
     """
     Returns reference to the network's Classifier region
     """
+    classifierName = "Classifier" + (str(i) if i is not None else "")
     if (self._netInfo.net is not None and
-        "Classifier" in self._netInfo.net.regions):
-      return self._netInfo.net.regions["Classifier"]
+        classifierName in self._netInfo.net.regions):
+      return self._netInfo.net.regions[classifierName]
     else:
       return None
 
@@ -1179,22 +1194,29 @@ class HTMPredictionModel(Model):
     if clEnable and clParams is not None:
       clParams = clParams.copy()
       clRegionName = clParams.pop('regionName')
-      self.__logger.debug("Adding %s; clParams: %r" % (clRegionName,
-                                                      clParams))
-      n.addRegion("Classifier", "py.%s" % str(clRegionName), json.dumps(clParams))
+      clPredictedFields = clParams.pop('predictedFields', [""])
+      
+      for i, pf in enumerate(clPredictedFields):
+        self.__logger.debug("Adding %s%i; clParams: %r" % (clRegionName, i,
+                                                           clParams))
+        clRawName = "Classifier"
+        if len(clPredictedFields) > 1:
+          clRawName += "%i" % (i)
+        n.addRegion(clRawName, "py.%s" % str(clRegionName), json.dumps(clParams))
+  
+        # SDR Classifier-specific links
+        if str(clRegionName) == "SDRClassifierRegion":
+          n.link("sensor", clRawName, "UniformLink", "", srcOutput="actValueOut",
+                 destInput="actValueIn")
+          n.link("sensor", clRawName, "UniformLink", "", srcOutput="bucketIdxOut",
+                 destInput="bucketIdxIn")
+  
+        # This applies to all (SDR and KNN) classifiers
+        n.link("sensor", clRawName, "UniformLink", "", srcOutput="categoryOut",
+               destInput="categoryIn")
+  
+        n.link(prevRegion, clRawName, "UniformLink", "")
 
-      # SDR Classifier-specific links
-      if str(clRegionName) == "SDRClassifierRegion":
-        n.link("sensor", "Classifier", "UniformLink", "", srcOutput="actValueOut",
-               destInput="actValueIn")
-        n.link("sensor", "Classifier", "UniformLink", "", srcOutput="bucketIdxOut",
-               destInput="bucketIdxIn")
-
-      # This applies to all (SDR and KNN) classifiers
-      n.link("sensor", "Classifier", "UniformLink", "", srcOutput="categoryOut",
-             destInput="categoryIn")
-
-      n.link(prevRegion, "Classifier", "UniformLink", "")
 
     if self.getInferenceType() == InferenceType.TemporalAnomaly:
       anomalyClParams = dict(
@@ -1296,10 +1318,6 @@ class HTMPredictionModel(Model):
       self.__dict__.pop("_HTMPredictionModel__nonTemporalNetInfo", None)
       self.__dict__.pop("_HTMPredictionModel__temporalNetInfo", None)
 
-
-    # This gets filled in during the first infer because it can only be
-    #  determined at run-time
-    self._classifierInputEncoder = None
 
     if not hasattr(self, '_minLikelihoodThreshold'):
       self._minLikelihoodThreshold = DEFAULT_LIKELIHOOD_THRESHOLD
